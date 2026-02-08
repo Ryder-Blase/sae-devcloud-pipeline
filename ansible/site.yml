@@ -1,0 +1,12 @@
+---
+- name: Déploiement complet
+  import_playbook: 00-init.yml
+  
+- name: Configuration GitLab
+  import_playbook: 01-gitlab.yml
+
+- name: Configuration Kubernetes
+  import_playbook: 02-kubernetes.yml
+
+- name: Déploiement de l'application
+  import_playbook: 03-deploy-app.yml

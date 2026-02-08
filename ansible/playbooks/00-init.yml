@@ -1,0 +1,73 @@
+---
+- name: Configuration initiale de toutes les VMs
+  hosts: all
+  become: yes
+  tasks:
+    - name: Mise à jour du système
+      apt:
+        update_cache: yes
+        upgrade: dist
+        
+    - name: Installation des paquets de base
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - vim
+          - htop
+          - net-tools
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - apt-transport-https
+        state: present
+
+    - name: Configuration du hostname
+      hostname:
+        name: "{{ inventory_hostname_short }}"
+
+    - name: Désactiver le swap
+      command: swapoff -a
+      when: "'k8s' in group_names"
+
+    - name: Désactiver le swap de manière permanente
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^([^#].*\s+swap\s+.*)$'
+        line: '# \1'
+        backrefs: yes
+      when: "'k8s' in group_names"
+
+    - name: Charger les modules kernel
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+      when: "'k8s' in group_names"
+
+    - name: Configurer les modules au démarrage
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+      when: "'k8s' in group_names"
+
+    - name: Configuration sysctl pour Kubernetes
+      sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { name: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { name: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { name: 'net.ipv4.ip_forward', value: '1' }
+      when: "'k8s' in group_names"
+
+    - name: Redémarrer les VMs
+      reboot:
+        reboot_timeout: 300

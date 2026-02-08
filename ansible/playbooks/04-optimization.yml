@@ -1,0 +1,64 @@
+---
+- name: Optimisations système (VMs)
+  hosts: all
+  become: yes
+  tasks:
+    - name: Nettoyer les vieilles configs sysctl bridge sur non-k8s
+      file:
+        path: /etc/sysctl.d/99-sysctl.conf
+        state: absent
+      when: "'k8s' not in group_names"
+      ignore_errors: yes
+
+    - name: Configurer les paramètres sysctl de base
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/99-optimization.conf
+        reload: no
+      loop:
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+        - { key: 'vm.swappiness', value: '10' }
+        - { key: 'fs.inotify.max_user_watches', value: '524288' }
+        - { key: 'fs.file-max', value: '524288' }
+        - { key: 'net.core.somaxconn', value: '1024' }
+
+    - name: Appliquer sysctl manuellement
+      command: sysctl -p /etc/sysctl.d/99-optimization.conf
+      ignore_errors: yes
+
+- name: Optimisations réseau K8s
+  hosts: k8s
+  become: yes
+  tasks:
+    - name: Configurer bridge-nf-call-iptables (K8s uniquement)
+      sysctl:
+        name: "net.bridge.bridge-nf-call-iptables"
+        value: "1"
+        state: present
+        reload: no
+      ignore_errors: yes
+
+    - name: Augmenter les limites de ressources (ulimit)
+      pam_limits:
+        domain: '*'
+        limit_type: "{{ item.type }}"
+        limit_item: "{{ item.item }}"
+        value: "{{ item.value }}"
+      loop:
+        - { type: 'soft', item: 'nofile', value: '65536' }
+        - { type: 'hard', item: 'nofile', value: '65536' }
+        - { type: 'soft', item: 'nproc', value: '32768' }
+        - { type: 'hard', item: 'nproc', value: '32768' }
+
+    - name: Désactiver l'IPv6 (optionnel, pour stabilité réseau)
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        reload: no
+      loop:
+        - 'net.ipv6.conf.all.disable_ipv6'
+        - 'net.ipv6.conf.default.disable_ipv6'
+      ignore_errors: yes

@@ -1,0 +1,147 @@
+---
+- name: Installation et configuration de GitLab
+  hosts: gitlab
+  become: yes
+  vars:
+    gitlab_external_url: "http://{{ ansible_host }}"
+
+  tasks:
+    - name: Installation des dépendances GitLab
+      apt:
+        name:
+          - curl
+          - openssh-server
+          - ca-certificates
+          - tzdata
+          - perl
+          - postfix
+        state: present
+
+    - name: Télécharger le script d'installation GitLab
+      get_url:
+        url: https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh
+        dest: /tmp/gitlab_install.sh
+        mode: '0755'
+
+    - name: Exécuter le script d'installation GitLab
+      command: bash /tmp/gitlab_install.sh
+
+    - name: Installer GitLab CE
+      apt:
+        name: gitlab-ce
+        state: present
+        update_cache: yes
+      environment:
+        EXTERNAL_URL: "{{ gitlab_external_url }}"
+
+    - name: Configurer GitLab
+      lineinfile:
+        path: /etc/gitlab/gitlab.rb
+        regexp: "^external_url"
+        line: "external_url '{{ gitlab_external_url }}'"
+
+    - name: Configurer le registre Docker GitLab
+      blockinfile:
+        path: /etc/gitlab/gitlab.rb
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - REGISTRY"
+        block: |
+          registry_external_url 'http://{{ ansible_host }}:5050'
+          gitlab_rails['registry_enabled'] = true
+          registry['enable'] = true
+          gitlab_rails['registry_host'] = "{{ ansible_host }}"
+          gitlab_rails['registry_port'] = "5050"
+
+    - name: Optimiser les performances GitLab
+      blockinfile:
+        path: /etc/gitlab/gitlab.rb
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - PERFORMANCE"
+        block: |
+          # Performance Tuning for 8GB RAM
+          puma['worker_processes'] = 2
+          puma['max_threads'] = 4
+          puma['min_threads'] = 1
+          sidekiq['max_concurrency'] = 10
+          # Disable monitoring stack to save RAM/CPU
+          prometheus_monitoring['enable'] = false
+          alertmanager['enable'] = false
+          node_exporter['enable'] = false
+          gitlab_rails['env'] = {
+            'MALLOC_CONF' => 'dirty_decay_ms:1000,muzzy_decay_ms:1000'
+          }
+
+    - name: Reconfigurer GitLab
+      command: gitlab-ctl reconfigure
+
+    - name: Attendre que GitLab soit prêt
+      wait_for:
+        port: 80
+        delay: 10
+        timeout: 600
+
+    - name: Récupérer le mot de passe root initial
+      slurp:
+        src: /etc/gitlab/initial_root_password
+      register: gitlab_root_password
+      ignore_errors: yes
+
+    - name: Afficher le mot de passe root
+      debug:
+        msg: "Mot de passe root GitLab: {{ (gitlab_root_password.content | b64decode).split('\n')[1] | regex_replace('^Password: (.*)$', '\\1') }}"
+      when: gitlab_root_password is succeeded
+
+    - name: Télécharger le script d'installation GitLab Runner
+      get_url:
+        url: https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh
+        dest: /tmp/gitlab-runner-repo.sh
+        mode: '0755'
+
+    - name: Exécuter le script d'installation du dépôt GitLab Runner
+      command: bash /tmp/gitlab-runner-repo.sh
+      args:
+        creates: /etc/apt/sources.list.d/runner_gitlab-runner.list
+
+    - name: Installation de GitLab Runner
+      apt:
+        name: gitlab-runner
+        state: present
+        update_cache: yes
+
+    - name: Démarrer GitLab Runner
+      systemd:
+        name: gitlab-runner
+        state: started
+        enabled: yes
+
+    - name: Installation de Docker pour le Runner
+      block:
+        - name: Ajouter la clé GPG Docker
+          apt_key:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            state: present
+
+        - name: Ajouter le dépôt Docker
+          apt_repository:
+            repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+            state: present
+
+        - name: Installer Docker
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-compose-plugin
+            state: present
+            update_cache: yes
+
+        - name: Ajouter gitlab-runner au groupe docker
+          user:
+            name: gitlab-runner
+            groups: docker
+            append: yes
+
+        - name: Démarrer Docker
+          systemd:
+            name: docker
+            state: started
+            enabled: yes

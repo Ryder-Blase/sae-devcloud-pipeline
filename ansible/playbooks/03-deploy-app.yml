@@ -1,0 +1,135 @@
+---
+- name: Déploiement de l'application Python
+  hosts: k8s_master
+  become: no
+  vars:
+    app_name: "addressbook"
+    app_namespace: "production"
+    gitlab_registry: "{{ hostvars['gitlab-vm']['ansible_host'] }}:5050"
+    
+  tasks:
+    - name: Créer le namespace
+      command: kubectl create namespace {{ app_namespace }}
+      environment:
+        KUBECONFIG: /home/debian/.kube/config
+      ignore_errors: yes
+
+    - name: Créer le secret pour le registre Docker
+      command: >
+        kubectl create secret docker-registry gitlab-registry
+        --docker-server={{ gitlab_registry }}
+        --docker-username=gitlab-ci-token
+        --docker-password=VOTRE_TOKEN
+        --namespace={{ app_namespace }}
+      environment:
+        KUBECONFIG: /home/debian/.kube/config
+      ignore_errors: yes
+
+    - name: Créer le répertoire des manifests
+      file:
+        path: /home/debian/k8s-manifests
+        state: directory
+        mode: '0755'
+
+    - name: Copier le deployment manifest
+      copy:
+        dest: /home/debian/k8s-manifests/deployment.yaml
+        content: |
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: {{ app_name }}
+            namespace: {{ app_namespace }}
+          spec:
+            replicas: 3
+            selector:
+              matchLabels:
+                app: {{ app_name }}
+            template:
+              metadata:
+                labels:
+                  app: {{ app_name }}
+              spec:
+                imagePullSecrets:
+                  - name: gitlab-registry
+                containers:
+                - name: {{ app_name }}
+                  image: {{ gitlab_registry }}/root/addressbook:latest
+                  imagePullPolicy: IfNotPresent
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: PORT
+                    value: "8080"
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "250m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "500m"
+                  livenessProbe:
+                    httpGet:
+                      path: /addresses/
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /addresses/
+                      port: 8080
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+
+    - name: Copier le service manifest
+      copy:
+        dest: /home/debian/k8s-manifests/service.yaml
+        content: |
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: {{ app_name }}-service
+            namespace: {{ app_namespace }}
+          spec:
+            type: NodePort
+            selector:
+              app: {{ app_name }}
+            ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 8080
+              nodePort: 30080
+
+    - name: Appliquer les manifests
+      command: kubectl apply -f /home/debian/k8s-manifests/
+      environment:
+        KUBECONFIG: /home/debian/.kube/config
+
+    - name: Attendre que les pods soient prêts
+      shell: |
+        for i in $(seq 1 30); do
+          READY=$(kubectl get pods -n {{ app_namespace }} -l app={{ app_name }} 2>/dev/null | grep -c Running || true)
+          if [ "${READY:-0}" -ge 3 ]; then
+            echo "3 pods Running"
+            exit 0
+          fi
+          echo "Attente... (${READY:-0}/3 pods prêts)"
+          sleep 5
+        done
+        echo "Timeout après 150s"
+        exit 1
+      args:
+        executable: /bin/bash
+      environment:
+        KUBECONFIG: /home/debian/.kube/config
+      ignore_errors: yes
+
+    - name: Afficher l'état des déploiements
+      command: kubectl get all -n {{ app_namespace }}
+      register: deployment_status
+      environment:
+        KUBECONFIG: /home/debian/.kube/config
+
+    - name: Afficher les résultats
+      debug:
+        var: deployment_status.stdout_lines
