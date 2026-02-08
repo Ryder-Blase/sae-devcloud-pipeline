@@ -1,65 +1,19 @@
-# Configuration locale (contient des secrets)
-config.env.local
-terraform.tfvars
-
-# État Terraform
+# Terraform
 terraform/.terraform/
-terraform/*.tfstate
-terraform/*.tfstate.backup
 terraform/.terraform.lock.hcl
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
 
 # Ansible
+ansible/inventory.ini
 ansible/*.retry
-ansible/.vault_pass
 
-# Logs
+# Logs et temporaires
 *.log
 /tmp/
 deployment-info.txt
+python-app.tar.gz
 
-# SSH keys
-*.pem
-*.key
-id_rsa*
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Environnements virtuels
-venv/
-ENV/
-env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Backups
-*.bak
-*.backup
+# SSH
+.ssh/
