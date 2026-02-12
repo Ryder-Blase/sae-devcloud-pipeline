@@ -50,8 +50,8 @@ collect_configuration() {
     print_section "1/6 Configuration Proxmox"
     echo ""
     
-    read -p "Adresse IP de votre serveur Proxmox [192.168.122.127]: " PROXMOX_HOST
-    PROXMOX_HOST=${PROXMOX_HOST:-192.168.122.127}
+    read -p "Adresse IP de votre serveur Proxmox [10.129.4.31]: " PROXMOX_HOST
+    PROXMOX_HOST=${PROXMOX_HOST:-10.129.4.31}
     
     read -p "Utilisateur Proxmox [root]: " PROXMOX_USER
     PROXMOX_USER=${PROXMOX_USER:-root}
@@ -72,11 +72,11 @@ collect_configuration() {
     print_section "2/6 Détection des ressources du serveur"
     echo ""
     
-    read -p "Nombre de CPU/threads disponibles [6]: " TOTAL_CPU
-    TOTAL_CPU=${TOTAL_CPU:-6}
+    read -p "Nombre de CPU/threads disponibles [4]: " TOTAL_CPU
+    TOTAL_CPU=${TOTAL_CPU:-4}
     
-    read -p "RAM disponible en GB [16]: " TOTAL_RAM_GB
-    TOTAL_RAM_GB=${TOTAL_RAM_GB:-16}
+    read -p "RAM disponible en GB [32]: " TOTAL_RAM_GB
+    TOTAL_RAM_GB=${TOTAL_RAM_GB:-32}
     
     # Calcul automatique des ressources optimales
     TOTAL_RAM=$((TOTAL_RAM_GB * 1024))
@@ -86,13 +86,13 @@ collect_configuration() {
     AVAILABLE_RAM=$((TOTAL_RAM * 7 / 10))
     
     # Distribution
-    read -p "Nombre de vCPUs par VM (GitLab & K8s) [6]: " VM_CORES
-    VM_CORES=${VM_CORES:-6}
+    read -p "Nombre de vCPUs par VM (GitLab & K8s) [4]: " VM_CORES
+    VM_CORES=${VM_CORES:-4}
     GITLAB_CORES=$VM_CORES
     INFRA_CORES=$VM_CORES
 
-    GITLAB_MEMORY=8192
-    INFRA_MEMORY=4096
+    GITLAB_MEMORY=10240
+    INFRA_MEMORY=8192
 
     echo ""
     echo "Ressources allouées :"
@@ -116,33 +116,42 @@ collect_configuration() {
     
     # ===== Configuration réseau =====
     print_section "3/6 Configuration réseau"
-    echo ""
+    echo "Choisissez le mode d'adressage IP :"
+    echo "  1) Statique (recommandé pour Kubernetes)"
+    echo "  2) DHCP (Dynamique)"
+    read -p "Sélection [1]: " IP_MODE_SEL
+    IP_MODE_SEL=${IP_MODE_SEL:-1}
+
+    if [ "$IP_MODE_SEL" = "2" ]; then
+        IP_MODE="dhcp"
+        print_info "Mode DHCP sélectionné. Les IPs seront récupérées dynamiquement via Proxmox Agent."
+        IP_GITLAB="dhcp"
+        IP_INFRA1="dhcp"
+        IP_INFRA2="dhcp"
+        IP_INFRA3="dhcp"
+        GATEWAY=""
+        NETMASK="24"
+    else
+        IP_MODE="static"
+        # Détecter le réseau depuis l'IP Proxmox
+        NETWORK_PREFIX=$(echo $PROXMOX_HOST | cut -d. -f1-3)
+        read -p "Passerelle réseau [${NETWORK_PREFIX}.1]: " GATEWAY
+        GATEWAY=${GATEWAY:-${NETWORK_PREFIX}.1}
+        read -p "Masque réseau CIDR [24]: " NETMASK
+        NETMASK=${NETMASK:-24}
+        echo ""
+        echo "IPs des VMs (suggérées sur le réseau ${NETWORK_PREFIX}.0/${NETMASK}) :"
+        read -p "  IP GitLab VM [${NETWORK_PREFIX}.42]: " IP_GITLAB
+        IP_GITLAB=${IP_GITLAB:-${NETWORK_PREFIX}.42}
+        read -p "  IP K8s Master [${NETWORK_PREFIX}.43]: " IP_INFRA1
+        IP_INFRA1=${IP_INFRA1:-${NETWORK_PREFIX}.43}
+        read -p "  IP K8s Worker 1 [${NETWORK_PREFIX}.44]: " IP_INFRA2
+        IP_INFRA2=${IP_INFRA2:-${NETWORK_PREFIX}.44}
+        read -p "  IP K8s Worker 2 [${NETWORK_PREFIX}.45]: " IP_INFRA3
+        IP_INFRA3=${IP_INFRA3:-${NETWORK_PREFIX}.45}
+    fi
     
-    # Détecter le réseau depuis l'IP Proxmox
-    NETWORK_PREFIX=$(echo $PROXMOX_HOST | cut -d. -f1-3)
-    
-    read -p "Passerelle réseau [${NETWORK_PREFIX}.1]: " GATEWAY
-    GATEWAY=${GATEWAY:-${NETWORK_PREFIX}.1}
-    
-    read -p "Masque réseau CIDR [24]: " NETMASK
-    NETMASK=${NETMASK:-24}
-    
-    echo ""
-    echo "IPs des VMs (suggérées sur le réseau ${NETWORK_PREFIX}.0/${NETMASK}) :"
-    
-    read -p "  IP GitLab VM [${NETWORK_PREFIX}.41]: " IP_GITLAB
-    IP_GITLAB=${IP_GITLAB:-${NETWORK_PREFIX}.41}
-    
-    read -p "  IP K8s Master [${NETWORK_PREFIX}.42]: " IP_INFRA1
-    IP_INFRA1=${IP_INFRA1:-${NETWORK_PREFIX}.42}
-    
-    read -p "  IP K8s Worker 1 [${NETWORK_PREFIX}.43]: " IP_INFRA2
-    IP_INFRA2=${IP_INFRA2:-${NETWORK_PREFIX}.43}
-    
-    read -p "  IP K8s Worker 2 [${NETWORK_PREFIX}.44]: " IP_INFRA3
-    IP_INFRA3=${IP_INFRA3:-${NETWORK_PREFIX}.44}
-    
-    print_success "Configuration réseau enregistrée"
+    print_success "Configuration réseau ($IP_MODE) enregistrée"
     
     # ===== Configuration SSH =====
     print_section "4/6 Configuration SSH des VMs"
@@ -388,22 +397,19 @@ fi
 echo "Création du template VM..."
 qm create $TEMPLATE_ID --name $TEMPLATE_NAME --memory 2048 --cores 2 --net0 virtio,bridge=vmbr0
 
-# 5. Importer le disque
-echo "Import du disque..."
-qm importdisk $TEMPLATE_ID /var/lib/vz/template/iso/ubuntu-22.04-cloudimg.img $STORAGE &> /dev/null
+# 5. Importer et Configurer le disque (Méthode Robuste)
+echo "Import et configuration du disque (Cloud-Image)..."
+qm set $TEMPLATE_ID --scsihw virtio-scsi-pci --boot c --bootdisk scsi0
+# Utilisation de import-from pour éviter les erreurs de noms de disque (disk-0 vs disk-1)
+qm set $TEMPLATE_ID --scsi0 ${STORAGE}:0,import-from=/var/lib/vz/template/iso/ubuntu-22.04-cloudimg.img
 
-# 6. Configurer le disque
-echo "Configuration du disque..."
-qm set $TEMPLATE_ID --scsihw virtio-scsi-pci --scsi0 ${STORAGE}:vm-${TEMPLATE_ID}-disk-0 &> /dev/null
-qm set $TEMPLATE_ID --boot c --bootdisk scsi0 &> /dev/null
+# 6. Configuration Cloud-Init
+echo "Configuration Cloud-Init..."
+qm set $TEMPLATE_ID --ide2 ${STORAGE}:cloudinit
+qm set $TEMPLATE_ID --serial0 socket --vga serial0
+qm set $TEMPLATE_ID --agent enabled=1
 
-# 7. Configurer cloud-init
-echo "Configuration cloud-init..."
-qm set $TEMPLATE_ID --ide2 ${STORAGE}:cloudinit &> /dev/null
-qm set $TEMPLATE_ID --serial0 socket --vga serial0 &> /dev/null
-qm set $TEMPLATE_ID --agent enabled=0 &> /dev/null
-
-# 8. Convertir en template
+# 7. Conversion en template
 echo "Conversion en template..."
 qm template $TEMPLATE_ID
 # Vérifier si c'est bien un template
@@ -476,6 +482,9 @@ proxmox_tls_insecure = true
 proxmox_node   = "${PROXMOX_NODE}"
 template_name  = "${TEMPLATE_NAME}"
 storage_name   = "${STORAGE_NAME}"
+
+ip_mode = "${IP_MODE}"
+netmask = "${NETMASK}"
 
 ssh_user     = "${SSH_USER}"
 ssh_password = "${SSH_PASSWORD}"
@@ -557,6 +566,11 @@ EOF
         sed -i '/cores   = var.*_cores/a \    type    = "host"' "$SCRIPT_DIR/terraform/main.tf"
     }
     
+    # Correction d'un bug potentiel sur les virgules dans ipconfig0 (uniquement en statique)
+    if [ "$IP_MODE" = "static" ]; then
+        sed -i 's/ip=${var.gitlab_ip},/ip=${var.gitlab_ip}\/24,/g' "$SCRIPT_DIR/terraform/main.tf" 2>/dev/null || true
+    fi
+    
     print_success "Configuration Terraform générée"
 }
 
@@ -580,6 +594,57 @@ deploy_infrastructure() {
     
     print_success "Infrastructure déployée"
     
+    cd "$SCRIPT_DIR"
+}
+
+# ============================================================================
+# ÉTAPE 6bis : DÉCOUVERTE DES IPS (PROVISIONNEMENT DYNAMIQUE)
+# ============================================================================
+
+discover_ips() {
+    print_title "Découverte des adresses IP"
+    cd "$SCRIPT_DIR/terraform"
+    
+    if [ "$IP_MODE" = "dhcp" ]; then
+        print_info "Attente des adresses DHCP (Proxmox Agent)..."
+        local max_attempts=18
+        local attempt=1
+        
+        while [ $attempt -le $max_attempts ]; do
+            print_info "Tentative de récupération $attempt/$max_attempts..."
+            terraform refresh &>/dev/null
+            
+            # Vérifier si l'IP de GitLab est remontée (le pivot)
+            LT_GITLAB=$(terraform output -raw gitlab_vm_ip 2>/dev/null || echo "")
+            IP_GITLAB=$(echo $LT_GITLAB | tr -d '"' | tr -d '\r')
+            
+            if [[ -n "$IP_GITLAB" && "$IP_GITLAB" != "dhcp" && "$IP_GITLAB" != "" ]]; then
+                print_success "Adresses IP détectées via l'agent QEMU !"
+                break
+            fi
+            
+            if [ $attempt -eq $max_attempts ]; then
+                print_error "Délai d'attente dépassé (3 minutes). L'agent Proxmox ne répond pas."
+                exit 1
+            fi
+            
+            sleep 10
+            attempt=$((attempt + 1))
+        done
+    fi
+
+    # Récupération finale de toutes les IPs
+    LT_GITLAB=$(terraform output -raw gitlab_vm_ip 2>/dev/null || echo "$IP_GITLAB")
+    LT_INFRA1=$(terraform output -raw infra1_vm_ip 2>/dev/null || echo "$IP_INFRA1")
+    LT_INFRA2=$(terraform output -raw infra2_vm_ip 2>/dev/null || echo "$IP_INFRA2")
+    LT_INFRA3=$(terraform output -raw infra3_vm_ip 2>/dev/null || echo "$IP_INFRA3")
+    
+    IP_GITLAB=$(echo $LT_GITLAB | tr -d '"' | tr -d '\r')
+    IP_INFRA1=$(echo $LT_INFRA1 | tr -d '"' | tr -d '\r')
+    IP_INFRA2=$(echo $LT_INFRA2 | tr -d '"' | tr -d '\r')
+    IP_INFRA3=$(echo $LT_INFRA3 | tr -d '"' | tr -d '\r')
+
+    print_success "Provisionnement Dynamique OK : GitLab=$IP_GITLAB, Master=$IP_INFRA1"
     cd "$SCRIPT_DIR"
 }
 
@@ -737,7 +802,7 @@ sudo mkdir -p /etc/docker
 # Créer la configuration avec insecure-registries
 sudo tee /etc/docker/daemon.json > /dev/null <<'DOCKEREOF'
 {
-  "insecure-registries": ["${IP_GITLAB}:5050", "192.168.122.41:5050", "localhost:5050"],
+  "insecure-registries": ["${IP_GITLAB}:5050", "10.129.4.41:5050", "localhost:5050"],
   "registry-mirrors": [],
   "storage-driver": "overlay2"
 }
@@ -956,20 +1021,54 @@ EOSSH
         exit 1
     fi
     
-    # Configuration du .gitlab-ci.yml
-    print_info "Configuration .gitlab-ci.yml..."
+    # Génération d'un token d'accès via rails pour l'API (AVANT utilisation)
+    PRIVATE_TOKEN="sae-token-$(date +%s)"
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        ${SSH_USER}@${IP_GITLAB} <<EOSSH
+sudo gitlab-rails runner "
+user = User.find_by_username('root')
+token = user.personal_access_tokens.create(scopes: ['api', 'write_repository'], name: 'SAE-Deploy-Token', expires_at: 30.days.from_now)
+token.set_token('${PRIVATE_TOKEN}')
+token.save!
+
+# Récupérer le mot de passe root initial et l'injecter comme variable de projet
+root_password = File.read('/etc/gitlab/initial_root_password').match(/Password: (.*)/)[1].strip rescue nil
+project = Project.find_by_full_path('root/addressbook')
+if project && root_password
+  var = project.variables.find_or_initialize_by(key: 'STABLE_REGISTRY_TOKEN')
+  var.update!(value: root_password, protected: false, masked: true)
+  puts 'SUCCESS: STABLE_REGISTRY_TOKEN set'
+end
+" > /dev/null 2>&1
+EOSSH
+
+    # Configuration des fichiers de pipeline et tests
+    print_section "Injection des variables d'infrastructure dans GitLab..."
     
-    # Ajout des variables Docker pour registry HTTP
-    if ! grep -q "DOCKER_TLS_CERTDIR" "$SCRIPT_DIR/python/.gitlab-ci.yml"; then
-        sed -i '/DOCKER_DRIVER: overlay2/a\  DOCKER_TLS_CERTDIR: ""\n  DOCKER_HOST: "unix:///var/run/docker.sock"' "$SCRIPT_DIR/python/.gitlab-ci.yml"
-    fi
+    # Liste des variables à injecter
+    declare -A CI_VARS
+    CI_VARS=(
+        ["GITLAB_IP"]="${IP_GITLAB}"
+        ["MASTER_IP"]="${IP_INFRA1}"
+        ["WORKER1_IP"]="${IP_INFRA2}"
+        ["WORKER2_IP"]="${IP_INFRA3}"
+        ["SSH_PASS"]="${SSH_PASSWORD}"
+        ["CI_REGISTRY"]="${IP_GITLAB}:5050"
+    )
+
+    for KEY in "${!CI_VARS[@]}"; do
+        VALUE="${CI_VARS[$KEY]}"
+        # On tente un POST (création), si ça échoue (déjà existant), on fait un PUT (mise à jour)
+        curl -s -X POST -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+            "http://${IP_GITLAB}/api/v4/projects/root%2Faddressbook/variables" \
+            --data "key=${KEY}&value=${VALUE}" > /dev/null
+        
+        curl -s -X PUT -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+            "http://${IP_GITLAB}/api/v4/projects/root%2Faddressbook/variables/${KEY}" \
+            --data "value=${VALUE}" > /dev/null
+    done
     
-    # Mettre à jour les IPs
-    sed -i "s|CI_REGISTRY:.*|CI_REGISTRY: \"${IP_GITLAB}:5050\"|g" "$SCRIPT_DIR/python/.gitlab-ci.yml"
-    sed -i "s|192\.168\.122\.42|${IP_INFRA1}|g" "$SCRIPT_DIR/python/.gitlab-ci.yml"
-    sed -i "s|192\.168\.122\.41|${IP_GITLAB}|g" "$SCRIPT_DIR/python/.gitlab-ci.yml"
-    
-    print_success "Configuration .gitlab-ci.yml mise à jour"
+    print_success "Variables d'infrastructure injectées via API"
 
     print_section "Configuration de la variable CI SSH_PRIVATE_KEY..."
     
@@ -1013,38 +1112,62 @@ EOSSH
             fi
         fi
     done
-    
-    print_success "Configuration SSH terminée"
-    
+
+    # Ajout de la clé SSH à GitLab via l'API
+    SSH_KEY_PATH="$HOME/.ssh/id_rsa"
+    if [ ! -f "$SSH_KEY_PATH" ]; then
+        ssh-keygen -t rsa -b 4096 -f "$SSH_KEY_PATH" -N ""
+    fi
+    SSH_PUBLIC_KEY=$(cat ${SSH_KEY_PATH}.pub)
+    curl -s -X POST -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+        "http://${IP_GITLAB}/api/v4/user/keys" \
+        -d "title=SAE-Key-$(date +%s)" \
+        --data-urlencode "key=${SSH_PUBLIC_KEY}" > /dev/null
+
+    # Configuration SSH locale pour GitLab
+    mkdir -p ~/.ssh
+    if ! grep -q "Host ${IP_GITLAB}" ~/.ssh/config 2>/dev/null; then
+        cat >> ~/.ssh/config <<EOF
+
+# GitLab SAE - Auto-généré
+Host ${IP_GITLAB}
+    HostName ${IP_GITLAB}
+    User git
+    IdentityFile ${SSH_KEY_PATH}
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+EOF
+        chmod 600 ~/.ssh/config
+    fi
+
     print_section "Push du code Python vers GitLab..."
     
+    # Lever la protection de la branche main pour permettre le force push
+    curl -s -X DELETE -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+        "http://${IP_GITLAB}/api/v4/projects/root%2Faddressbook/protected_branches/main" > /dev/null
+
     # Initialiser et pousser le code
     cd "$SCRIPT_DIR/python"
     
-    if [ ! -d .git ]; then
-        git init
-        git config user.name "Root"
-        git config user.email "root@gitlab.local"
-        git add .
-        git commit -m "Initial commit - AddressBook with CI/CD" >/dev/null 2>&1
+    # Nettoyage pour repartir sur du propre (comme dans git-push.sh)
+    rm -rf .git
+    
+    git init --initial-branch=main
+    git config user.name "Administrator"
+    git config user.email "admin@gitlab.local"
+    
+    git add .
+    git commit -m "Initial commit - AddressBook with CI/CD" >/dev/null 2>&1 || true
+    
+    git remote add origin git@${IP_GITLAB}:root/addressbook.git
+    
+    # Push via SSH sans masquer les erreurs pour le debug
+    print_info "Tentative de push vers git@${IP_GITLAB}:root/addressbook.git..."
+    if git push -u origin main --force; then
+        print_success "Code poussé vers GitLab (via SSH)"
+    else
+        print_error "Échec du push. Vérifiez la connexion SSH."
     fi
-    
-    git branch -M main 2>/dev/null || true
-    git remote remove origin 2>/dev/null || true
-    git remote add origin http://root@${IP_GITLAB}/root/addressbook.git
-    
-    # Créer un helper askpass pour automatiser l'authentification
-    cat > /tmp/git-askpass.sh <<EOF
-#!/bin/bash
-echo '${GITLAB_PASSWORD}'
-EOF
-    chmod +x /tmp/git-askpass.sh
-    
-    GIT_ASKPASS=/tmp/git-askpass.sh GIT_TERMINAL_PROMPT=0 git push -f origin main >/dev/null 2>&1 && \
-        print_success "Code poussé vers GitLab" || \
-        print_success "Push terminé"
-    
-    rm -f /tmp/git-askpass.sh
     
     cd "$SCRIPT_DIR"
     
@@ -1175,6 +1298,7 @@ EOF
     setup_proxmox_and_template
     generate_terraform_config
     deploy_infrastructure
+    discover_ips
     generate_ansible_inventory
     wait_for_vms
     configure_vms

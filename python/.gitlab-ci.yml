@@ -9,12 +9,14 @@ stages:
 variables:
   DOCKER_DRIVER: overlay2
   DOCKER_TLS_CERTDIR: ""
-  DOCKER_HOST:  # Variables d'Infrastructure (Injectées par deploy.sh via GitLab API)
-  GITLAB_IP: "10.129.4.10"
-  MASTER_IP: "10.129.4.11"
-  WORKER1_IP: "10.129.4.12"
-  WORKER2_IP: "10.129.4.13"
-  SSH_PASS: "debian123"
+  DOCKER_HOST: "unix:///var/run/docker.sock"
+  
+  # Infrastructure Variables (Managed via GitLab API by deploy.sh)
+  # GITLAB_IP: ""
+  # MASTER_IP: ""
+  # WORKER1_IP: ""
+  # WORKER2_IP: ""
+  # SSH_PASS: ""
   
   CI_REGISTRY: "${GITLAB_IP}:5050"
   IMAGE_NAME: "${CI_REGISTRY}/root/addressbook"
@@ -117,8 +119,8 @@ deploy-with-ansible:
       ssh-add ~/.ssh/id_rsa
       echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
       # DNS du pauvre : Mapping des noms logiques
-      echo "${GITLAB_IP} gitlab-registry" | sudo tee -a /etc/hosts || true
-      echo "${MASTER_IP} k8s-master" | sudo tee -a /etc/hosts || true
+      echo "${GITLAB_IP} gitlab-registry" | tee -a /etc/hosts || true
+      echo "${MASTER_IP} k8s-master" | tee -a /etc/hosts || true
   script:
     - |
       cat > inventory.ini <<EOF
@@ -188,7 +190,7 @@ deploy-with-ansible:
               --namespace=production
               --docker-server={{ registry_url }}
               --docker-username=root
-              --docker-password="{{ stable_token | default(ci_token, true) }}"
+              --docker-password="{{ lookup('env', 'STABLE_REGISTRY_TOKEN') | default(lookup('env', 'CI_JOB_TOKEN'), true) }}"
               --docker-email=admin@example.com
               --dry-run=client -o yaml | kubectl apply -f -
 
@@ -222,6 +224,9 @@ deploy-with-ansible:
                 ports: [{protocol: TCP, port: 30080, targetPort: 8080, nodePort: {{ app_port }} }]
                 type: NodePort
               EOD
+
+          - name: Force Rollout Restart
+            shell: kubectl rollout restart deployment/addressbook -n production
 
           - name: Wait for Deployment Rollout
             shell: kubectl rollout status deployment/addressbook -n production --timeout=120s

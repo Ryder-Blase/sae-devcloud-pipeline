@@ -31,26 +31,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 print_title "Configuration Git et Push vers GitLab (AUTO)"
 
 # ============================================================================
-# ÉTAPE 1 : COLLECTE DES INFORMATIONS
+# ÉTAPE 1 : COLLECTE DES INFORMATIONS RÉSEAU
 # ============================================================================
 
-# Récupérer l'IP GitLab depuis deployment-info.txt
+# Récupérer les informations existantes si possible
 if [ -f "$SCRIPT_DIR/deployment-info.txt" ]; then
-    print_info "Lecture des informations de déploiement..."
-    GITLAB_IP=$(grep -i "gitlab" "$SCRIPT_DIR/deployment-info.txt" | grep "http://" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-    
-    if [ -n "$GITLAB_IP" ]; then
-        print_success "IP GitLab trouvée: $GITLAB_IP"
-    fi
+    print_info "Lecture des informations de déploiement existantes..."
+    # GitLab IP (.50 suggéré par le user)
+    SUGGESTED_GITLAB=$(grep -i "gitlab" "$SCRIPT_DIR/deployment-info.txt" | grep "http://" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    # Master IP (.51 suggéré par le user)
+    SUGGESTED_MASTER=$(grep -i "master" "$SCRIPT_DIR/deployment-info.txt" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 fi
 
-# Demander l'IP si pas trouvée
-if [ -z "$GITLAB_IP" ]; then
-    read -p "Adresse IP de votre GitLab [192.168.122.41]: " GITLAB_IP
-    GITLAB_IP=${GITLAB_IP:-192.168.122.41}
-fi
+SUGGESTED_GITLAB=${SUGGESTED_GITLAB:-10.129.4.50}
+SUGGESTED_MASTER=${SUGGESTED_MASTER:-10.129.4.51}
+SUGGESTED_WORKER1=$(echo $SUGGESTED_MASTER | sed -E 's/\.[0-9]+$/\.52/')
+SUGGESTED_WORKER2=$(echo $SUGGESTED_MASTER | sed -E 's/\.[0-9]+$/\.53/')
 
-# Informations du projet
+print_title "Configuration des adresses IP"
+
+read -p "  IP GitLab VM [$SUGGESTED_GITLAB]: " IP_GITLAB
+IP_GITLAB=${IP_GITLAB:-$SUGGESTED_GITLAB}
+read -p "  IP K8s Master [$SUGGESTED_MASTER]: " IP_INFRA1
+IP_INFRA1=${IP_INFRA1:-$SUGGESTED_MASTER}
+read -p "  IP K8s Worker 1 [$SUGGESTED_WORKER1]: " IP_INFRA2
+IP_INFRA2=${IP_INFRA2:-$SUGGESTED_WORKER1}
+read -p "  IP K8s Worker 2 [$SUGGESTED_WORKER2]: " IP_INFRA3
+IP_INFRA3=${IP_INFRA3:-$SUGGESTED_WORKER2}
+
+GITLAB_IP=$IP_GITLAB
 GITLAB_USER="root"
 PROJECT_NAME="addressbook"
 SSH_USER="debian"
@@ -60,7 +69,27 @@ SSH_PASSWORD="debian123"
 GITLAB_URL="http://${GITLAB_IP}"
 GITLAB_REMOTE="git@${GITLAB_IP}:${GITLAB_USER}/${PROJECT_NAME}.git"
 
-print_success "Configuration: $GITLAB_URL"
+# ============================================================================
+# ÉTAPE 1.5 : PATCHING DES FICHIERS CI/CD
+# ============================================================================
+
+print_title "Patching des fichiers de configuration"
+
+FILES_TO_PATCH=("$SCRIPT_DIR/test.sh")
+
+for TARGET_FILE in "${FILES_TO_PATCH[@]}"; do
+    if [ -f "$TARGET_FILE" ]; then
+        print_info "Patching local de $TARGET_FILE..."
+        
+        # Mise à jour des IPs dans test.sh (script local)
+        sed -i -E "s|(IP_GITLAB=\")[0-9\.]+|\1${IP_GITLAB}|g" "$TARGET_FILE"
+        sed -i -E "s|(IP_MASTER=\")[0-9\.]+|\1${IP_INFRA1}|g" "$TARGET_FILE"
+        sed -i -E "s|(IP_WORKER1=\")[0-9\.]+|\1${IP_INFRA2}|g" "$TARGET_FILE"
+        sed -i -E "s|(IP_WORKER2=\")[0-9\.]+|\1${IP_INFRA3}|g" "$TARGET_FILE"
+    fi
+done
+
+print_success "Fichiers patchés avec succès"
 
 # ============================================================================
 # ÉTAPE 2 : RÉCUPÉRER LE MOT DE PASSE ROOT GITLAB
@@ -92,7 +121,7 @@ print_info "Génération du token via gitlab-rails (cela peut prendre 30s)..."
 PRIVATE_TOKEN="sae-token-$(date +%s)"
 
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    ${SSH_USER}@${GITLAB_IP} <<EOSSH
+    ${SSH_USER}@${IP_GITLAB} <<EOSSH
 sudo gitlab-rails runner "
 user = User.find_by_username('root')
 token = user.personal_access_tokens.create(scopes: ['api', 'write_repository'], name: 'SAE-Deploy-Token', expires_at: 30.days.from_now)
@@ -196,21 +225,51 @@ else
 fi
 
 # ============================================================================
+# ÉTAPE 5.5 : INJECTION DES VARIABLES CI/CD VIA API
+# ============================================================================
+
+print_title "Injection des variables dans GitLab"
+
+declare -A CI_VARS
+CI_VARS=(
+    ["GITLAB_IP"]="${IP_GITLAB}"
+    ["MASTER_IP"]="${IP_INFRA1}"
+    ["WORKER1_IP"]="${IP_INFRA2}"
+    ["WORKER2_IP"]="${IP_INFRA3}"
+    ["SSH_PASS"]="${SSH_PASSWORD}"
+    ["CI_REGISTRY"]="${IP_GITLAB}:5050"
+    ["STABLE_REGISTRY_TOKEN"]="${GITLAB_ROOT_PASSWORD}"
+)
+
+for KEY in "${!CI_VARS[@]}"; do
+    VALUE="${CI_VARS[$KEY]}"
+    # Création ou Mise à jour
+    curl -s -X POST -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+        "${GITLAB_URL}/api/v4/projects/${GITLAB_USER}%2F${PROJECT_NAME}/variables" \
+        --data "key=${KEY}&value=${VALUE}" > /dev/null
+    
+    curl -s -X PUT -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+        "${GITLAB_URL}/api/v4/projects/${GITLAB_USER}%2F${PROJECT_NAME}/variables/${KEY}" \
+        --data "value=${VALUE}" > /dev/null
+done
+
+print_success "Variables d'infrastructure synchronisées sur GitLab"
+
+# ============================================================================
 # ÉTAPE 6 : CONFIGURATION GIT LOCALE
 # ============================================================================
 
-print_title "Configuration Git locale"
+print_title "Configuration Git locale (Dossier Python)"
 
-cd "$SCRIPT_DIR"
+cd "$SCRIPT_DIR/python"
 
-# Vérifier si git est déjà initialisé
-if [ -d "$SCRIPT_DIR/.git" ]; then
-    print_info "Repository Git déjà initialisé"
-else
-    print_info "Initialisation du repository Git..."
-    git init --initial-branch=main --object-format=sha1
-    print_success "Repository Git initialisé"
-fi
+# Nettoyage et Initialisation
+print_info "Nettoyage de l'ancien historique Git..."
+rm -rf .git
+
+print_info "Initialisation du repository Git dans ./python..."
+git init --initial-branch=main --object-format=sha1
+print_success "Repository Git initialisé"
 
 # Configurer l'identité Git locale
 git config --local user.name "Administrator"
@@ -232,29 +291,8 @@ fi
 
 print_success "Remote configuré: $GITLAB_REMOTE"
 
-# Mettre à jour le .gitignore
-print_info "Vérification du .gitignore..."
-cat > "$SCRIPT_DIR/.gitignore" <<'EOF'
-# Terraform
-terraform/.terraform/
-terraform/.terraform.lock.hcl
-terraform/terraform.tfstate
-terraform/terraform.tfstate.backup
-terraform/terraform.tfvars
-
-# Ansible
-ansible/inventory.ini
-ansible/*.retry
-
-# Logs et temporaires
-*.log
-/tmp/
-deployment-info.txt
-python-app.tar.gz
-
-# SSH
-.ssh/
-EOF
+# Note: Pas de .gitignore à générer ici car on utilise celui du dossier python
+print_info "Vérification des fichiers..."
 
 # Ajouter tous les fichiers
 print_info "Ajout des fichiers au commit..."
@@ -292,6 +330,28 @@ Fonctionnalités:
 - Pipeline CI/CD automatique"
     print_success "Commit créé"
 fi
+
+# ÉTAPE 8 : CONFIGURATION DES VARIABLES CI ET ACCÈS SSH LOCAL
+# ============================================================================
+
+print_title "Configuration finale des accès"
+
+print_info "Autorisation de la clé SSH sur le GitLab VM..."
+ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    ${SSH_USER}@${GITLAB_IP} <<EOSSH
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
+    if ! grep -q "$(cat $SSH_KEY_PATH.pub)" ~/.ssh/authorized_keys 2>/dev/null; then
+        echo "$(cat $SSH_KEY_PATH.pub)" >> ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        echo "OK: Clé locale ajoutée aux authorized_keys"
+    fi
+EOSSH
+
+# Lever la protection de la branche main
+print_info "Déprotection de la branche main..."
+curl -s -X DELETE -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+    "${GITLAB_URL}/api/v4/projects/root%2F${PROJECT_NAME}/protected_branches/main" > /dev/null
 
 # Test de connexion SSH avant le push
 print_info "Test de connexion SSH à GitLab..."
