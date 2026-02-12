@@ -1,27 +1,80 @@
 stages:
+  - test
   - build
   - scan
   - deploy
   - performance
+  - pages
 
 variables:
   DOCKER_DRIVER: overlay2
   DOCKER_TLS_CERTDIR: ""
-  DOCKER_HOST: "unix:///var/run/docker.sock"
-  CI_REGISTRY: "192.168.122.41:5050"
+  DOCKER_HOST:  # Variables d'Infrastructure (Injectées par deploy.sh via GitLab API)
+  GITLAB_IP: "10.129.4.10"
+  MASTER_IP: "10.129.4.11"
+  WORKER1_IP: "10.129.4.12"
+  WORKER2_IP: "10.129.4.13"
+  SSH_PASS: "debian123"
+  
+  CI_REGISTRY: "${GITLAB_IP}:5050"
   IMAGE_NAME: "${CI_REGISTRY}/root/addressbook"
+  APP_PORT: "30080"
+  APP_URL: "http://${MASTER_IP}:${APP_PORT}"
+  
   TRIVY_NO_PROGRESS: "true"
   TRIVY_SEVERITY: "HIGH,CRITICAL"
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+    - venv/
+
+unit-tests:
+  stage: test
+  image: python:3.9-slim
+  tags: [deployment]
+  before_script:
+    - pip install -r requirements.txt
+    - pip install pytest pytest-asyncio pytest-cov
+  script:
+    - export PYTHONPATH=$PYTHONPATH:.
+    - pytest --cov=addrservice --cov-report=term --cov-report=xml --cov-report=html tests/
+  artifacts:
+    paths: [htmlcov/]
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+
+code-quality:
+  stage: test
+  image: python:3.9-slim
+  tags: [deployment]
+  script:
+    - pip install flake8
+    - echo "Analyse statique du code..."
+    - flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+    - flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+secret-detection:
+  stage: test
+  image: 
+    name: trufflesecurity/trufflehog:latest
+    entrypoint: [""]
+  tags: [deployment]
+  script:
+    - trufflehog git file://. --only-verified --fail
+  allow_failure: true
 
 build-image:
   stage: build
-  tags:
-    - deployment
+  tags: [deployment]
   script:
     - echo "[1/3] Login au registre"
     - echo "${CI_JOB_TOKEN}" | docker login ${CI_REGISTRY} -u gitlab-ci-token --password-stdin
-    - echo "[2/3] Build de l'image"
-    - docker build -t ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} -t ${IMAGE_NAME}:latest .
+    - echo "[2/3] Build avec cache"
+    - docker build --cache-from ${IMAGE_NAME}:latest -t ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} -t ${IMAGE_NAME}:latest .
     - echo "[3/3] Push de l'image"
     - docker push ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}
     - docker push ${IMAGE_NAME}:latest
@@ -31,191 +84,193 @@ security-scan:
   image:
     name: aquasec/trivy:latest
     entrypoint: [""]
-  tags:
-    - deployment
+  tags: [deployment]
   script:
-    - trivy image --insecure --severity ${TRIVY_SEVERITY} ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} || true
-    - trivy image --insecure --format json --output trivy-report.json ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA} || true
-  artifacts:
-    paths:
-      - trivy-report.json
-    expire_in: 7 days
-    when: always
+    - echo "Scan des vulnérabilités de l'image..."
+    - trivy image --insecure --severity ${TRIVY_SEVERITY} ${IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}
+    - echo "Scan des fichiers de configuration (IaC)..."
+    - trivy config --severity HIGH,CRITICAL .
   allow_failure: true
 
 deploy-with-ansible:
   stage: deploy
   image: ubuntu:22.04
-  tags:
-    - deployment
+  tags: [deployment]
   before_script:
+    - export DEBIAN_FRONTEND=noninteractive
     - apt-get update -qq && apt-get install -y openssh-client ansible sshpass
     - |
       if [ -z "$SSH_PRIVATE_KEY" ]; then
-        echo "[ERREUR] La variable SSH_PRIVATE_KEY est vide. Vérifiez la configuration dans GitLab."
+        echo "[ERREUR] La variable SSH_PRIVATE_KEY est vide."
         exit 1
       fi
       eval $(ssh-agent -s)
-      if [ -f "$SSH_PRIVATE_KEY" ]; then
-        echo "Utilisation de SSH_PRIVATE_KEY (type File)"
-        chmod 400 "$SSH_PRIVATE_KEY"
-        ssh-add "$SSH_PRIVATE_KEY"
-      else
-        echo "Utilisation de SSH_PRIVATE_KEY (type Variable)"
-        printf '%s\n' "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
-      fi
       mkdir -p ~/.ssh
       chmod 700 ~/.ssh
+      if [ -f "$SSH_PRIVATE_KEY" ]; then
+          cp "$SSH_PRIVATE_KEY" ~/.ssh/id_rsa
+      else
+          echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+      fi
+      sed -i '$a\' ~/.ssh/id_rsa
+      chmod 600 ~/.ssh/id_rsa
+      ssh-add ~/.ssh/id_rsa
       echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config
+      # DNS du pauvre : Mapping des noms logiques
+      echo "${GITLAB_IP} gitlab-registry" | sudo tee -a /etc/hosts || true
+      echo "${MASTER_IP} k8s-master" | sudo tee -a /etc/hosts || true
   script:
-    - echo "[1/3] Inventaire"
     - |
       cat > inventory.ini <<EOF
-      [master]
-      192.168.122.42 ansible_user=debian
-      [workers]
-      192.168.122.43 ansible_user=debian
-      192.168.122.44 ansible_user=debian
+      [gitlab]
+      ${GITLAB_IP} ansible_user=debian ansible_ssh_pass=${SSH_PASS}
+      
+      [k8s_master]
+      ${MASTER_IP} ansible_user=debian ansible_ssh_pass=${SSH_PASS}
+      
+      [k8s_workers]
+      ${WORKER1_IP} ansible_user=debian ansible_ssh_pass=${SSH_PASS}
+      ${WORKER2_IP} ansible_user=debian ansible_ssh_pass=${SSH_PASS}
+
+      [k8s:children]
+      k8s_master
+      k8s_workers
       EOF
-    - echo "[2/3] Création Playbook"
+    
+    - |
+      cat > fix_registry.yml <<'EOF'
+      ---
+      - name: Configure Insecure Registry (Fix 02-kubernetes.yml)
+        hosts: k8s
+        become: yes
+        tasks:
+          - name: Create certs.d directory
+            file:
+              path: "/etc/containerd/certs.d/{{ hostvars[groups['gitlab'][0]]['inventory_hostname'] }}:5050"
+              state: directory
+              mode: '0755'
+          
+          - name: Write hosts.toml
+            copy:
+              dest: "/etc/containerd/certs.d/{{ hostvars[groups['gitlab'][0]]['inventory_hostname'] }}:5050/hosts.toml"
+              content: |
+                server = "http://{{ hostvars[groups['gitlab'][0]]['inventory_hostname'] }}:5050"
+                [host."http://{{ hostvars[groups['gitlab'][0]]['inventory_hostname'] }}:5050"]
+                  capabilities = ["pull", "resolve"]
+              mode: '0644'
+
+          - name: Restart containerd
+            systemd:
+              name: containerd
+              state: restarted
+      EOF
+      
+      ansible-playbook -i inventory.ini fix_registry.yml
+
     - |
       cat > deploy-app.yml <<'EOF'
       ---
-      - name: Pre-pull image on all nodes
-        hosts: all
-        become: yes
-        gather_facts: no
+      - name: HA Deployment
+        hosts: k8s_master
+        become: no
+        vars:
+          registry_url: "{{ lookup('env', 'CI_REGISTRY') }}"
+          stable_token: "{{ lookup('env', 'STABLE_REGISTRY_TOKEN') }}"
+          ci_token: "{{ lookup('env', 'CI_JOB_TOKEN') }}"
+          app_port: "{{ lookup('env', 'APP_PORT') | default('30080', true) }}"
         tasks:
-          - name: Pull image securely
-            command: ctr -n k8s.io image pull --plain-http --user gitlab-ci-token:{{ lookup('env', 'CI_JOB_TOKEN') }} 192.168.122.41:5050/root/addressbook:latest
+          - name: Create Namespace
+            shell: kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Déploiement HA
-        hosts: master
-        gather_facts: no
-        tasks:
-          - name: Secret Registre
-            shell: |
-              kubectl create secret docker-registry gitlab-registry \
-              --docker-server=192.168.122.41:5050 \
-              --docker-username=gitlab-ci-token \
-              --docker-password={{ lookup('env', 'CI_JOB_TOKEN') }} \
-              -n production --dry-run=client -o yaml | kubectl apply -f -
+          - name: Create Registry Secret
+            shell: >
+              kubectl create secret docker-registry gitlab-registry
+              --namespace=production
+              --docker-server={{ registry_url }}
+              --docker-username=root
+              --docker-password="{{ stable_token | default(ci_token, true) }}"
+              --docker-email=admin@example.com
+              --dry-run=client -o yaml | kubectl apply -f -
 
-          - name: Nettoyage Deployment
-            command: kubectl delete deployment addressbook -n production --ignore-not-found=true
-
-          - name: HA Deployment
+          - name: Push K8s manifest
             shell: |
               cat <<EOD | kubectl apply -f -
               apiVersion: apps/v1
               kind: Deployment
-              metadata:
-                name: addressbook
-                namespace: production
+              metadata: {name: addressbook, namespace: production}
               spec:
                 replicas: 3
-                selector:
-                  matchLabels:
-                    app: addressbook
+                selector: {matchLabels: {app: addressbook}}
                 template:
-                  metadata:
-                    labels: {app: addressbook}
+                  metadata: {labels: {app: addressbook}}
                   spec:
                     imagePullSecrets: [{name: gitlab-registry}]
-                    affinity:
-                      podAntiAffinity:
-                        preferredDuringSchedulingIgnoredDuringExecution:
-                        - weight: 100
-                          podAffinityTerm:
-                            labelSelector:
-                              matchExpressions:
-                              - key: app
-                                operator: In
-                                values: [addressbook]
-                            topologyKey: "kubernetes.io/hostname"
-                    tolerations:
-                    - key: "node-role.kubernetes.io/control-plane"
-                      operator: "Exists"
-                      effect: "NoSchedule"
                     containers:
                     - name: addressbook
-                      image: 192.168.122.41:5050/root/addressbook:latest
-                      imagePullPolicy: IfNotPresent
+                      image: {{ registry_url }}/root/addressbook:latest
                       ports: [{containerPort: 8080}]
-                      resources:
-                        requests: {cpu: 50m, memory: 64Mi}
-                        limits: {cpu: 500m, memory: 256Mi}
-              ---
-              apiVersion: policy/v1
-              kind: PodDisruptionBudget
-              metadata:
-                name: addressbook-pdb
-                namespace: production
-              spec:
-                minAvailable: 2
-                selector:
-                  matchLabels:
-                    app: addressbook
+                      readinessProbe:
+                        httpGet: {path: /addresses/, port: 8080}
+                        initialDelaySeconds: 10
+                        periodSeconds: 5
               ---
               apiVersion: v1
               kind: Service
-              metadata:
-                name: addressbook-service
-                namespace: production
+              metadata: {name: addressbook-service, namespace: production}
               spec:
-                selector:
-                  app: addressbook
-                ports:
-                  - protocol: TCP
-                    port: 30080
-                    targetPort: 8080
-                    nodePort: 30080
+                selector: {app: addressbook}
+                ports: [{protocol: TCP, port: 30080, targetPort: 8080, nodePort: {{ app_port }} }]
                 type: NodePort
               EOD
 
-          - name: Attente Ready
+          - name: Wait for Deployment Rollout
+            shell: kubectl rollout status deployment/addressbook -n production --timeout=120s
+
+          - name: Final Health Check
             shell: |
-              for i in {1..20}; do
-                if [ "$(kubectl get pods -n production -l app=addressbook -o jsonpath='{.items[*].status.containerStatuses[*].ready}' | grep -o true | wc -l)" -ge 2 ]; then
-                  echo "Pods are ready"
+              for i in {1..12}; do
+                if curl -s http://localhost:{{ app_port }}/addresses/ > /dev/null; then
+                  echo "Application is UP"
                   exit 0
                 fi
-                echo "Waiting..."
+                echo "Wait for application... ($i/12)"
                 sleep 5
               done
               exit 1
-
-          - name: Restart Rollout
-            command: kubectl rollout restart deployment addressbook -n production
       EOF
-    - echo "[3/3] Ansible Play"
     - ansible-playbook -i inventory.ini deploy-app.yml
+  environment:
+    name: production
+    url: ${APP_URL}
 
 load-test:
   stage: performance
   image:
     name: grafana/k6:latest
     entrypoint: [""]
-  tags:
-    - deployment
+  tags: [deployment]
   script:
     - |
-      for i in {1..15}; do
-        if wget --spider -q http://192.168.122.42:30080/addresses/; then
-          echo "App is reachable"
-          break
-        fi
-        echo "Waiting for app to be reachable..."
-        sleep 5
-      done
-    - |
-      k6 run - <<'EOF'
+      k6 run -e APP_URL="${APP_URL}" - <<'EOF'
       import http from 'k6/http';
+      import { sleep } from 'k6';
+      
       export const options = { vus: 10, duration: '20s' };
+      
       export default function () {
-        http.get('http://192.168.122.42:30080/addresses/');
+        const url = `${__ENV.APP_URL}/addresses/`;
+        http.get(url);
+        sleep(1);
       }
       EOF
-  only:
-    - main
-    - master
+
+pages:
+  stage: pages
+  tags: [deployment]
+  dependencies: [unit-tests]
+  script:
+    - mkdir -p public
+    - cp -r htmlcov/* public/
+  artifacts:
+    paths: [public]
+  only: [main, master]
