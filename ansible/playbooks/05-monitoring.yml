@@ -1,0 +1,118 @@
+---
+- name: Deploy Monitoring Stack (Prometheus + Grafana)
+  hosts: gitlab
+  become: yes
+  vars:
+    master_ip: "{{ hostvars[groups['k8s_master'][0]]['ansible_host'] }}"
+    
+  tasks:
+    - name: Ensure monitoring directory exists
+      file:
+        path: /opt/monitoring
+        state: directory
+        mode: '0755'
+
+    - name: Ensure grafana provisioning directories exist
+      file:
+        path: /opt/monitoring/grafana/provisioning/{{ item }}
+        state: directory
+        mode: '0755'
+      loop:
+        - datasources
+        - dashboards
+
+    - name: Create Prometheus configuration
+      copy:
+        dest: /opt/monitoring/prometheus.yml
+        content: |
+          global:
+            scrape_interval: 15s
+
+          scrape_configs:
+            - job_name: 'production'
+              static_configs:
+                - targets: ['{{ master_ip }}:30080']
+            
+            - job_name: 'stagging'
+              static_configs:
+                - targets: ['{{ master_ip }}:30081']
+
+    - name: Create Grafana Datasource configuration
+      copy:
+        dest: /opt/monitoring/grafana/provisioning/datasources/datasources.yaml
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Prometheus
+              type: prometheus
+              access: proxy
+              url: http://prometheus:9090
+              isDefault: true
+
+    - name: Ensure grafana dashboards directory exists
+      file:
+        path: /opt/monitoring/grafana/dashboards
+        state: directory
+        mode: '0755'
+
+    - name: Create Grafana Dashboard provider configuration
+      copy:
+        dest: /opt/monitoring/grafana/provisioning/dashboards/dashboards.yaml
+        content: |
+          apiVersion: 1
+          providers:
+            - name: 'default'
+              orgId: 1
+              folder: ''
+              type: file
+              disableDeletion: false
+              updateIntervalSeconds: 10
+              options:
+                path: /var/lib/grafana/dashboards
+
+    - name: Copy Nginx Dashboard
+      copy:
+        dest: /opt/monitoring/grafana/dashboards/nginx-dashboard.json
+        content: "{{ lookup('file', '../../templates-grafana/grafana/nginx-dashboard.json') }}"
+
+    - name: Create Docker Compose file
+      copy:
+        dest: /opt/monitoring/compose.yaml
+        content: |
+          services:
+            prometheus:
+              image: prom/prometheus:latest
+              container_name: prometheus
+              volumes:
+                - ./prometheus.yml:/etc/prometheus/prometheus.yml
+              command:
+                - '--config.file=/etc/prometheus/prometheus.yml'
+              ports:
+                - "9090:9090"
+              networks:
+                - monitoring-net
+
+            grafana:
+              image: grafana/grafana:latest
+              container_name: grafana
+              environment:
+                - GF_SECURITY_ADMIN_PASSWORD=admin
+                - GF_USERS_ALLOW_SIGN_UP=false
+              volumes:
+                - ./grafana/provisioning:/etc/grafana/provisioning
+                - ./grafana/dashboards:/var/lib/grafana/dashboards
+              ports:
+                - "3000:3000"
+              networks:
+                - monitoring-net
+              depends_on:
+                - prometheus
+
+          networks:
+            monitoring-net:
+              driver: bridge
+
+    - name: Start Monitoring Stack
+      command: docker compose up -d --remove-orphans
+      args:
+        chdir: /opt/monitoring
