@@ -63,7 +63,7 @@ resource "proxmox_vm_qemu" "gitlab" {
     ]
   }
 
-  ipconfig0 = "ip=192.168.122.41/24,gw=192.168.122.1"
+  ipconfig0 = var.ip_mode == "dhcp" ? "ip=dhcp" : "ip=${var.gitlab_ip}/${var.netmask},gw=${var.gateway}"
 
   ciuser     = var.ssh_user
   cipassword = var.ssh_password
@@ -119,7 +119,7 @@ resource "proxmox_vm_qemu" "infra1" {
     ]
   }
 
-  ipconfig0 = "ip=192.168.122.42/24,gw=192.168.122.1"
+  ipconfig0 = var.ip_mode == "dhcp" ? "ip=dhcp" : "ip=${var.infra1_ip}/${var.netmask},gw=${var.gateway}"
 
   ciuser     = var.ssh_user
   cipassword = var.ssh_password
@@ -175,7 +175,7 @@ resource "proxmox_vm_qemu" "infra2" {
     ]
   }
 
-  ipconfig0 = "ip=192.168.122.43/24,gw=192.168.122.1"
+  ipconfig0 = var.ip_mode == "dhcp" ? "ip=dhcp" : "ip=${var.infra2_ip}/${var.netmask},gw=${var.gateway}"
 
   ciuser     = var.ssh_user
   cipassword = var.ssh_password
@@ -231,7 +231,7 @@ resource "proxmox_vm_qemu" "infra3" {
     ]
   }
 
-  ipconfig0 = "ip=192.168.122.44/24,gw=192.168.122.1"
+  ipconfig0 = var.ip_mode == "dhcp" ? "ip=dhcp" : "ip=${var.infra3_ip}/${var.netmask},gw=${var.gateway}"
 
   ciuser     = var.ssh_user
   cipassword = var.ssh_password

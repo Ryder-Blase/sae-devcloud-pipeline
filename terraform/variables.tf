@@ -4,7 +4,7 @@ variable "proxmox_api_url" {
 }
 
 variable "proxmox_user" {
-  description = "Utilisateur Proxmox (ex: root@pam)"
+  description = "Utilisateur Proxmox"
   type        = string
 }
 
@@ -38,10 +38,22 @@ variable "storage_name" {
   default     = "local-lvm"
 }
 
+variable "ip_mode" {
+  description = "Mode d'adressage IP (static ou dhcp)"
+  type        = string
+  default     = "static"
+}
+
+variable "netmask" {
+  description = "Masque réseau CIDR"
+  type        = string
+  default     = "24"
+}
+
 variable "ssh_user" {
   description = "Utilisateur SSH"
   type        = string
-  default     = "ubuntu"
+  default     = "debian"
 }
 
 variable "ssh_password" {
@@ -58,25 +70,25 @@ variable "ssh_public_key" {
 variable "gitlab_ip" {
   description = "Adresse IP pour GitLab VM"
   type        = string
-  default     = "10.129.4.41"
+  default     = "10.129.4.42"
 }
 
 variable "infra1_ip" {
   description = "Adresse IP pour Infrastructure VM 1"
   type        = string
-  default     = "10.129.4.42"
+  default     = "10.129.4.43"
 }
 
 variable "infra2_ip" {
   description = "Adresse IP pour Infrastructure VM 2"
   type        = string
-  default     = "10.129.4.43"
+  default     = "10.129.4.44"
 }
 
 variable "infra3_ip" {
   description = "Adresse IP pour Infrastructure VM 3"
   type        = string
-  default     = "10.129.4.44"
+  default     = "10.129.4.45"
 }
 
 variable "gateway" {
@@ -88,23 +100,23 @@ variable "gateway" {
 variable "gitlab_cores" {
   description = "Nombre de CPU pour GitLab VM"
   type        = number
-  default     = 2
+  default     = 4
 }
 
 variable "gitlab_memory" {
   description = "RAM pour GitLab VM en MB"
   type        = number
-  default     = 8192
+  default     = 10240
 }
 
 variable "infra_cores" {
   description = "Nombre de CPU pour les VMs K8s"
   type        = number
-  default     = 1
+  default     = 4
 }
 
 variable "infra_memory" {
   description = "RAM pour les VMs K8s en MB"
   type        = number
-  default     = 4096
+  default     = 8192
 }
