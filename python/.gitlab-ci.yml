@@ -94,7 +94,7 @@ security-scan:
     - trivy config --severity HIGH,CRITICAL .
   allow_failure: true
 
-deploy-with-ansible:
+.deploy-template:
   stage: deploy
   image: ubuntu:22.04
   tags: [deployment]
@@ -121,8 +121,6 @@ deploy-with-ansible:
       # DNS du pauvre : Mapping des noms logiques
       echo "${GITLAB_IP} gitlab-registry" | tee -a /etc/hosts || true
       echo "${MASTER_IP} k8s-master" | tee -a /etc/hosts || true
-  script:
-    - |
       cat > inventory.ini <<EOF
       [gitlab]
       ${GITLAB_IP} ansible_user=debian ansible_ssh_pass=${SSH_PASS}
@@ -138,7 +136,7 @@ deploy-with-ansible:
       k8s_master
       k8s_workers
       EOF
-    
+  script:
     - |
       cat > fix_registry.yml <<'EOF'
       ---
@@ -180,14 +178,44 @@ deploy-with-ansible:
           stable_token: "{{ lookup('env', 'STABLE_REGISTRY_TOKEN') }}"
           ci_token: "{{ lookup('env', 'CI_JOB_TOKEN') }}"
           app_port: "{{ lookup('env', 'APP_PORT') | default('30080', true) }}"
+          namespace: "{{ lookup('env', 'K8S_NAMESPACE') | default('production', true) }}"
         tasks:
           - name: Create Namespace
-            shell: kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+            shell: kubectl create namespace {{ namespace }} --dry-run=client -o yaml | kubectl apply -f -
+
+          - name: Create Nginx Config
+            shell: |
+              cat <<EOC | kubectl apply -f -
+              apiVersion: v1
+              kind: ConfigMap
+              metadata:
+                name: nginx-config
+                namespace: {{ namespace }}
+              data:
+                nginx.conf: |
+                  events {}
+                  http {
+                    server {
+                      listen 80;
+                      location / {
+                        proxy_pass http://localhost:8080;
+                      }
+                      location /stub_status {
+                        stub_status;
+                        allow 127.0.0.1;
+                        deny all;
+                      }
+                      location /metrics {
+                        proxy_pass http://localhost:9113/metrics;
+                      }
+                    }
+                  }
+              EOC
 
           - name: Create Registry Secret
             shell: >
               kubectl create secret docker-registry gitlab-registry
-              --namespace=production
+              --namespace={{ namespace }}
               --docker-server={{ registry_url }}
               --docker-username=root
               --docker-password="{{ lookup('env', 'STABLE_REGISTRY_TOKEN') | default(lookup('env', 'CI_JOB_TOKEN'), true) }}"
@@ -199,41 +227,105 @@ deploy-with-ansible:
               cat <<EOD | kubectl apply -f -
               apiVersion: apps/v1
               kind: Deployment
-              metadata: {name: addressbook, namespace: production}
+              metadata: {name: addressbook, namespace: {{ namespace }}}
               spec:
                 replicas: 3
                 selector: {matchLabels: {app: addressbook}}
                 template:
                   metadata: {labels: {app: addressbook}}
                   spec:
+                    affinity:
+                      podAntiAffinity:
+                        preferredDuringSchedulingIgnoredDuringExecution:
+                        - weight: 100
+                          podAffinityTerm:
+                            labelSelector:
+                              matchExpressions:
+                              - key: app
+                                operator: In
+                                values:
+                                - addressbook
+                            topologyKey: kubernetes.io/hostname
                     imagePullSecrets: [{name: gitlab-registry}]
                     containers:
                     - name: addressbook
                       image: {{ registry_url }}/root/addressbook:latest
                       ports: [{containerPort: 8080}]
+                      resources:
+                        requests:
+                          cpu: "100m"
+                        limits:
+                          cpu: "200m"
                       readinessProbe:
                         httpGet: {path: /addresses/, port: 8080}
                         initialDelaySeconds: 10
                         periodSeconds: 5
+                    - name: nginx
+                      image: nginx:alpine
+                      ports: [{containerPort: 80}]
+                      resources:
+                        requests:
+                          cpu: "20m"
+                        limits:
+                          cpu: "100m"
+                      volumeMounts:
+                        - name: nginx-config-vol
+                          mountPath: /etc/nginx/nginx.conf
+                          subPath: nginx.conf
+                    - name: exporter
+                      image: nginx/nginx-prometheus-exporter:latest
+                      args: ["-nginx.scrape-uri=http://localhost:80/stub_status"]
+                      ports: [{containerPort: 9113}]
+                      resources:
+                        requests:
+                          cpu: "10m"
+                        limits:
+                          cpu: "50m"
+                    volumes:
+                      - name: nginx-config-vol
+                        configMap:
+                          name: nginx-config
+              ---
+              apiVersion: autoscaling/v2
+              kind: HorizontalPodAutoscaler
+              metadata:
+                name: addressbook-hpa
+                namespace: {{ namespace }}
+              spec:
+                scaleTargetRef:
+                  apiVersion: apps/v1
+                  kind: Deployment
+                  name: addressbook
+                minReplicas: 2
+                maxReplicas: 10
+                metrics:
+                - type: Resource
+                  resource:
+                    name: cpu
+                    target:
+                      type: Utilization
+                      averageUtilization: 50
               ---
               apiVersion: v1
               kind: Service
-              metadata: {name: addressbook-service, namespace: production}
+              metadata: {name: addressbook-service, namespace: {{ namespace }}}
               spec:
                 selector: {app: addressbook}
-                ports: [{protocol: TCP, port: 30080, targetPort: 8080, nodePort: {{ app_port }} }]
+                ports: [{protocol: TCP, port: 30080, targetPort: 80, nodePort: {{ app_port }} }]
                 type: NodePort
               EOD
 
           - name: Force Rollout Restart
-            shell: kubectl rollout restart deployment/addressbook -n production
+            shell: kubectl rollout restart deployment/addressbook -n {{ namespace }}
 
           - name: Wait for Deployment Rollout
-            shell: kubectl rollout status deployment/addressbook -n production --timeout=120s
+            shell: kubectl rollout status deployment/addressbook -n {{ namespace }} --timeout=120s
 
           - name: Final Health Check
             shell: |
-              for i in {1..12}; do
+              for i in $(seq 1 12); do
+                # Check via Nginx (port 30080/nodePort -> 80) which proxies to 8080
+                # We simply check localhost:{{ app_port }} which maps to the Service
                 if curl -s http://localhost:{{ app_port }}/addresses/ > /dev/null; then
                   echo "Application is UP"
                   exit 0
@@ -244,11 +336,31 @@ deploy-with-ansible:
               exit 1
       EOF
     - ansible-playbook -i inventory.ini deploy-app.yml
+
+deploy-stagging:
+  extends: .deploy-template
+  variables:
+    K8S_NAMESPACE: stagging
+    APP_PORT: "30081"
+  environment:
+    name: stagging
+    url: http://${MASTER_IP}:30081
+  only:
+    - stagging
+
+deploy-production:
+  extends: .deploy-template
+  variables:
+    K8S_NAMESPACE: production
+    APP_PORT: "30080"
   environment:
     name: production
-    url: ${APP_URL}
+    url: http://${MASTER_IP}:30080
+  only:
+    - production
+    - tags
 
-load-test:
+.load-test-template:
   stage: performance
   image:
     name: grafana/k6:latest
@@ -260,14 +372,37 @@ load-test:
       import http from 'k6/http';
       import { sleep } from 'k6';
       
-      export const options = { vus: 10, duration: '20s' };
+      export const options = {
+        stages: [
+          { duration: '30s', target: 50 }, // Ramp up to 50 users
+          { duration: '1m', target: 50 },  // Stay at 50 users
+          { duration: '30s', target: 0 },  // Ramp down
+        ],
+      };
       
       export default function () {
         const url = `${__ENV.APP_URL}/addresses/`;
         http.get(url);
-        sleep(1);
+        sleep(0.1); // Aggressive requests
       }
       EOF
+
+load-test-staging:
+  extends: .load-test-template
+  variables:
+    APP_PORT: "30081"
+    APP_URL: "http://${MASTER_IP}:30081"
+  only:
+    - stagging
+
+load-test-production:
+  extends: .load-test-template
+  variables:
+    APP_PORT: "30080"
+    APP_URL: "http://${MASTER_IP}:30080"
+  only:
+    - production
+    - tags
 
 pages:
   stage: pages
@@ -278,4 +413,6 @@ pages:
     - cp -r htmlcov/* public/
   artifacts:
     paths: [public]
+  only: [main, master]
+
   only: [main, master]

@@ -246,11 +246,11 @@ for KEY in "${!CI_VARS[@]}"; do
     # Création ou Mise à jour
     curl -s -X POST -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
         "${GITLAB_URL}/api/v4/projects/${GITLAB_USER}%2F${PROJECT_NAME}/variables" \
-        --data "key=${KEY}&value=${VALUE}" > /dev/null
+        --data "key=${KEY}" --data-urlencode "value=${VALUE}" > /dev/null
     
     curl -s -X PUT -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
         "${GITLAB_URL}/api/v4/projects/${GITLAB_USER}%2F${PROJECT_NAME}/variables/${KEY}" \
-        --data "value=${VALUE}" > /dev/null
+        --data-urlencode "value=${VALUE}" > /dev/null
 done
 
 print_success "Variables d'infrastructure synchronisées sur GitLab"
@@ -362,9 +362,31 @@ else
 fi
 
 # Push vers GitLab
-print_info "Push vers GitLab (branch: main)..."
+print_info "Push vers GitLab (branches: main, stagging, production)..."
 
-if git push -u origin main --force 2>&1 | tee /tmp/git-push.log; then
+for branch in main stagging production; do
+    print_info "Pushing branch $branch..."
+    git checkout -B $branch
+    if git push -u origin $branch --force; then
+        print_success "Push $branch réussi!"
+    else
+        print_error "Échec du push $branch"
+        # On ne quitte pas forcément ici pour permettre le fallback de création de projet
+        # mais dans le script original il tee vers /tmp/git-push.log
+        git push -u origin main --force 2>&1 | tee /tmp/git-push.log
+        exit 1 # Forcer l'entrée dans le bloc else de la condition originale si besoin
+    fi
+done
+
+# Tag 1.0 sur production
+print_info "Adding and pushing tag 1.0 on production..."
+git checkout production
+git tag -f 1.0
+git push origin 1.0 --force
+git checkout main
+
+# Pour garder la structure du script original et son test de succès
+if [ $? -eq 0 ]; then
     print_success "Push réussi!"
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════${NC}"
@@ -397,21 +419,25 @@ else
             
             # Réessayer le push
             print_info "Nouveau push..."
-            if git push -u origin main --force; then
-                print_success "Push réussi après création du projet!"
-                echo ""
-                echo -e "${GREEN}════════════════════════════════════════════════${NC}"
-                echo -e "${GREEN}✓ Projet créé et code pushé!${NC}"
-                echo -e "${GREEN}════════════════════════════════════════════════${NC}"
-                echo ""
-                echo "🔗 URLs:"
-                echo "   Projet    : ${GITLAB_URL}/${GITLAB_USER}/${PROJECT_NAME}"
-                echo "   Pipelines : ${GITLAB_URL}/${GITLAB_USER}/${PROJECT_NAME}/-/pipelines"
-                echo ""
-            else
-                print_error "Échec du push après création du projet"
-                exit 1
-            fi
+            for branch in main stagging production; do
+                print_info "Pushing branch $branch..."
+                git checkout -B $branch
+                if git push -u origin $branch --force; then
+                    print_success "Push $branch réussi!"
+                else
+                    print_error "Échec du push $branch"
+                    exit 1
+                fi
+            done
+            
+            # Tag 1.0 sur production
+            print_info "Adding and pushing tag 1.0 on production..."
+            git checkout production
+            git tag -f 1.0
+            git push origin 1.0 --force
+            git checkout main
+            
+            print_success "Push réussi après création du projet!"
         else
             print_error "Impossible de créer le projet automatiquement"
             echo "Créez-le manuellement: ${GITLAB_URL}/projects/new"
@@ -426,3 +452,6 @@ else
 fi
 
 print_success "✅ Script terminé avec succès!"
+
+print_title "Mise à jour du Monitoring"
+ansible-playbook -i "$SCRIPT_DIR/ansible/inventory.ini" "$SCRIPT_DIR/ansible/playbooks/05-monitoring.yml"

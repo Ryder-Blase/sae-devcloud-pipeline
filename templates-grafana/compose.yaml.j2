@@ -1,0 +1,23 @@
+services:
+  nginx:
+    image: "{{ registry_image }}:{{ image_tag }}"
+    container_name: "nginx-{{ env_slug }}"
+    ports:
+      - "{{ nginx_port }}:80"
+    networks:
+      - monitoring-net
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:latest
+    container_name: "exporter-{{ env_slug }}"
+    command:
+      - "-nginx.scrape-uri=http://nginx:80/nginx_status"
+    networks:
+      - monitoring-net
+    depends_on:
+      - nginx
+
+networks:
+  monitoring-net:
+    name: monitoring-net
+    external: true

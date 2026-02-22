@@ -39,29 +39,34 @@
     - name: Générer la configuration par défaut de containerd
       shell: containerd config default > /etc/containerd/config.toml
 
-    - name: Configurer containerd pour utiliser systemd cgroup
-      lineinfile:
-        path: /etc/containerd/config.toml
-        regexp: '^\s+SystemdCgroup = false'
-        line: '            SystemdCgroup = true'
-        state: present
-
-    - name: Créer le répertoire de configuration pour le registre insecure
-      file:
-        path: "/etc/containerd/certs.d/{{ hostvars['gitlab-vm']['ansible_host'] }}:5050"
-        state: directory
-        mode: '0755'
+    - name: Configurer containerd pour utiliser systemd cgroup et certs.d
+      shell: |
+        # Activer SystemdCgroup
+        sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+        # Configurer le chemin des certificats (insecure registry)
+        # On remplace la valeur par defaut ou vide par notre chemin certs.d
+        sed -i "s|config_path = .*|config_path = '/etc/containerd/certs.d'|g" /etc/containerd/config.toml
+      notify: Redémarrer containerd
 
     - name: Configurer le registre insecure GitLab (hosts.toml)
-      copy:
-        dest: "/etc/containerd/certs.d/{{ hostvars['gitlab-vm']['ansible_host'] }}:5050/hosts.toml"
-        content: |
-          [host."http://{{ hostvars['gitlab-vm']['ansible_host'] }}:5050"]
-            capabilities = ["pull", "resolve"]
-            skip_verify = true
-        mode: '0644'
+      block:
+        - name: Créer le répertoire de configuration
+          file:
+            path: "/etc/containerd/certs.d/{{ hostvars['gitlab-vm']['ansible_host'] }}:5050"
+            state: directory
+            mode: '0755'
+        
+        - name: Écrire le fichier hosts.toml
+          copy:
+            dest: "/etc/containerd/certs.d/{{ hostvars['gitlab-vm']['ansible_host'] }}:5050/hosts.toml"
+            content: |
+              [host."http://{{ hostvars['gitlab-vm']['ansible_host'] }}:5050"]
+                capabilities = ["pull", "resolve"]
+            mode: '0644'
+      notify: Redémarrer containerd
 
 
+  handlers:
     - name: Redémarrer containerd
       systemd:
         name: containerd
@@ -187,3 +192,16 @@
     - name: Afficher les nodes
       debug:
         var: cluster_status.stdout_lines
+
+    - name: Installer metrics-server
+      command: kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+      environment:
+        KUBECONFIG: /home/debian/.kube/config
+
+    - name: Patcher metrics-server (kubelet-insecure-tls)
+      command: >
+        kubectl patch deployment metrics-server -n kube-system
+        --type=json
+        -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
+      environment:
+        KUBECONFIG: /home/debian/.kube/config

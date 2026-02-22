@@ -767,6 +767,10 @@ configure_vms() {
     ansible-playbook -i inventory.ini playbooks/04-optimization.yml
     print_success "VMs optimisées"
     
+    print_section "Étape additionnelle : Mise en place Monitoring (Grafana/Prometheus)"
+    ansible-playbook -i inventory.ini playbooks/05-monitoring.yml
+    print_success "Stack Monitoring déployée"
+    
     # Étape 4/4 : Déploiement initial de l'application (supprimé ici, géré par le pipeline CI/CD)
     
     cd "$SCRIPT_DIR"
@@ -1045,6 +1049,10 @@ EOSSH
     # Configuration des fichiers de pipeline et tests
     print_section "Injection des variables d'infrastructure dans GitLab..."
     
+    # Récupération du mot de passe root pour le registre
+    ROOT_PASS_CMD="sudo cat /etc/gitlab/initial_root_password | grep 'Password:' | cut -d' ' -f2"
+    GITLAB_ROOT_PASSWORD=$(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ${SSH_USER}@${IP_GITLAB} "${ROOT_PASS_CMD}")
+
     # Liste des variables à injecter
     declare -A CI_VARS
     CI_VARS=(
@@ -1054,6 +1062,7 @@ EOSSH
         ["WORKER2_IP"]="${IP_INFRA3}"
         ["SSH_PASS"]="${SSH_PASSWORD}"
         ["CI_REGISTRY"]="${IP_GITLAB}:5050"
+        ["STABLE_REGISTRY_TOKEN"]="${GITLAB_ROOT_PASSWORD}"
     )
 
     for KEY in "${!CI_VARS[@]}"; do
@@ -1061,11 +1070,11 @@ EOSSH
         # On tente un POST (création), si ça échoue (déjà existant), on fait un PUT (mise à jour)
         curl -s -X POST -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
             "http://${IP_GITLAB}/api/v4/projects/root%2Faddressbook/variables" \
-            --data "key=${KEY}&value=${VALUE}" > /dev/null
+            --data "key=${KEY}" --data-urlencode "value=${VALUE}" > /dev/null
         
         curl -s -X PUT -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
             "http://${IP_GITLAB}/api/v4/projects/root%2Faddressbook/variables/${KEY}" \
-            --data "value=${VALUE}" > /dev/null
+            --data-urlencode "value=${VALUE}" > /dev/null
     done
     
     print_success "Variables d'infrastructure injectées via API"
@@ -1142,9 +1151,31 @@ EOF
 
     print_section "Push du code Python vers GitLab..."
     
+    # Ajout du diagnostic pour PRIVATE_TOKEN
+    if [ -z "$PRIVATE_TOKEN" ]; then
+        print_error "Le token d'accès n'a pas pu être généré."
+        exit 1
+    fi
+
+    # Création du projet si il n'existe pas
+    print_section "Vérification/Création du projet GitLab..."
+    curl -s -X POST -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
+        "http://${IP_GITLAB}/api/v4/projects" \
+        -d "name=addressbook" -d "path=addressbook" -d "visibility=public" > /dev/null
+
     # Lever la protection de la branche main pour permettre le force push
+    # On le fait sur l'ID du projet ou le path encodé
     curl -s -X DELETE -H "PRIVATE-TOKEN: ${PRIVATE_TOKEN}" \
         "http://${IP_GITLAB}/api/v4/projects/root%2Faddressbook/protected_branches/main" > /dev/null
+
+    # Patching du script de test local (test.sh)
+    if [ -f "$SCRIPT_DIR/test.sh" ]; then
+        print_info "Patching du script local test.sh..."
+        sed -i -E "s|(IP_GITLAB=\")[0-9.]+|\1${IP_GITLAB}|g" "$SCRIPT_DIR/test.sh"
+        sed -i -E "s|(IP_MASTER=\")[0-9.]+|\1${IP_INFRA1}|g" "$SCRIPT_DIR/test.sh"
+    fi
+
+    # ... reste du script ...
 
     # Initialiser et pousser le code
     cd "$SCRIPT_DIR/python"
@@ -1162,12 +1193,23 @@ EOF
     git remote add origin git@${IP_GITLAB}:root/addressbook.git
     
     # Push via SSH sans masquer les erreurs pour le debug
-    print_info "Tentative de push vers git@${IP_GITLAB}:root/addressbook.git..."
-    if git push -u origin main --force; then
-        print_success "Code poussé vers GitLab (via SSH)"
-    else
-        print_error "Échec du push. Vérifiez la connexion SSH."
-    fi
+    print_info "Tentative de push vers git@${IP_GITLAB}:root/addressbook.git (branches: main, stagging, production)..."
+    for branch in main stagging production; do
+        print_info "Pushing branch $branch..."
+        git checkout -B $branch
+        if git push -u origin $branch --force; then
+            print_success "Push $branch réussi!"
+        else
+            print_error "Échec du push $branch"
+        fi
+    done
+    
+    # Tag 1.0 sur production
+    print_info "Adding and pushing tag 1.0 on production..."
+    git checkout production
+    git tag -f 1.0
+    git push origin 1.0 --force
+    git checkout main
     
     cd "$SCRIPT_DIR"
     
@@ -1199,6 +1241,9 @@ EOSSH
     echo "  3. Projet: root/addressbook"
     echo "  4. Le pipeline démarre automatiquement sur chaque push"
     echo ""
+
+    print_section "Redéploiement du Monitoring..."
+    ansible-playbook -i "$SCRIPT_DIR/ansible/inventory.ini" "$SCRIPT_DIR/ansible/playbooks/05-monitoring.yml"
 }
 
 # ============================================================================
@@ -1218,6 +1263,8 @@ URLS D'ACCÈS
 ─────────────────────────────────────────────────────────
 GitLab        : http://${IP_GITLAB}
 Registry      : http://${IP_GITLAB}:5050
+Grafana       : http://${IP_GITLAB}:3000 (admin/admin)
+Prometheus    : http://${IP_GITLAB}:9090
 Application   : http://${IP_INFRA1}:30080
 Proxmox       : https://${PROXMOX_HOST}:8006
 

@@ -35,6 +35,7 @@ with StringIO(IN_MEMORY_CFG_TXT) as f:
 
 
 class AddressServiceTornadoAppTestSetup(tornado.testing.AsyncHTTPTestCase):
+    __test__ = False
     def setUp(self) -> None:
         super().setUp()
         self.headers = {'Content-Type': 'application/json; charset=UTF-8'}

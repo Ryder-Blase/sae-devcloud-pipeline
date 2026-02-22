@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'nginx-exporters'
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        filters:
+          - name: name
+            values: ['exporter-.*']
+    relabel_configs:
+      - source_labels: [__meta_docker_container_name]
+        regex: '/exporter-(.*)'
+        target_label: environment
+      - source_labels: [__meta_docker_container_name]
+        regex: '/(.*)'
+        target_label: instance
+        replacement: '${1}:9113'
+      - source_labels: [__address__]
+        regex: '(.*):(.*)'
+        target_label: __address__
+        replacement: '${1}:9113'
